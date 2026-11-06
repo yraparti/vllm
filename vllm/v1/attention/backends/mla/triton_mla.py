@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import math
+import os
 from typing import ClassVar
 
 import torch
@@ -37,8 +38,10 @@ from vllm.v1.worker.workspace import (
 logger = init_logger(__name__)
 
 # num_kv_splits selection (shared by forward_mqa and the workspace reservation
-# so the two cannot drift). Both are hardware dependent.
-_MIN_WORK_PER_SPLIT = 512
+# so the two cannot drift). Both are hardware dependent. A windowed draft layer
+# with few query rows gets only window // 512 splits, too few programs to fill
+# the GPU; VLLM_TRITON_MLA_MIN_WORK_PER_SPLIT lowers the keys per split.
+_MIN_WORK_PER_SPLIT = int(os.getenv("VLLM_TRITON_MLA_MIN_WORK_PER_SPLIT", "512"))
 _SPLIT_OCCUPANCY_MULTIPLIER = 2
 
 
@@ -320,10 +323,11 @@ class TritonMLAImpl(MLACommonImpl[MLACommonMetadata]):
         assert isinstance(q, torch.Tensor)
         B = q.shape[0]
         q_num_heads = q.shape[1]
-        o = torch.zeros(
+        # stage 2 stores every (row, head) of o and lse
+        o = torch.empty(
             B, q_num_heads, self.kv_lora_rank, dtype=q.dtype, device=q.device
         )
-        lse = torch.zeros(B, q_num_heads, dtype=q.dtype, device=q.device)
+        lse = torch.empty(B, q_num_heads, dtype=q.dtype, device=q.device)
 
         # For batch invariance, use only 1 split to ensure deterministic reduction
         if envs.VLLM_BATCH_INVARIANT:

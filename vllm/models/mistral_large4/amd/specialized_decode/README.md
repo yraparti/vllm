@@ -95,10 +95,13 @@ per launch (the word and the clock are read every 32 polls of a wait).
 
 ## Layout
 
-Everything lives in this folder. The model files only call in: `model.py` (the
-config check in `MistralLarge4Model.__init__`, `plan` / `run` / `after_step` in
-`forward`, `get_model_state_cls`) and `../model_state.py` (builds the decode
-after load). `pixtral.py` forwards `get_model_state_cls` from its text model.
+vLLM keeps the runtime glue in this folder. The FlyDSL layer kernel and its
+host wrappers live in aiter (`aiter.ops.flydsl.mono` and
+`aiter.ops.flydsl.kernels.mono`). The model files only call in: `model.py`
+(the config check in `MistralLarge4Model.__init__`, `plan` / `run` /
+`after_step` in `forward`, `get_model_state_cls`) and `../model_state.py`
+(builds the decode after load). `pixtral.py` forwards `get_model_state_cls`
+from its text model.
 
 ```text
 runtime/
@@ -108,12 +111,16 @@ runtime/
     decode.py    SpecializedDecode: plan() -> Step, run(), after_step(), close()
     runner.py    per-rank launch state: weights, launchers, scratch, peers, fault word
     weights.py   vLLM modules -> kernel arguments; layer kinds
-    variants.py  the kernel package loaded once per layer kind (RoPE / NoPE / NoPE+KV-share)
-mono/            kernel source (adapted from ROCm/ATOM atom/models/glm52/mono, Apache-2.0)
-    kernel.py    the layer kernel; layout.py, geometry*.py, op.py (host wrapper)
-    common/      device ops, mailbox sync, peer memory, weight packing
-                 (adapted from ROCm/ATOM atom/mono, MIT)
+    variants.py  re-exports aiter.ops.flydsl.mono.variants
+```
+
+aiter hosts the kernel:
+
+```text
+aiter/ops/flydsl/kernels/mono/mistral_large4/gfx950/   kernel, layout, geometry
+aiter/ops/flydsl/mono/                                 op, variants, runtime, weights
 ```
 
 Tests: `tests/models/mistral_large4/amd_specialized_decode/` (CPU: switch,
-refusals, layer kinds, step routing).
+refusals, layer kinds, step routing). GPU layer check:
+`aiter/op_tests/flydsl_tests/test_mono_ml4_layer.py`.

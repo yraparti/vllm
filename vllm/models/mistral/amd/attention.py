@@ -207,9 +207,12 @@ class MistralMLAAttention(nn.Module):
                 rotary_emb.is_neox_style,
             )
         elif self.spec.use_rope:
-            q[..., self.qk_nope_head_dim :], k_pe = rotary_emb(
+            if not rotary_emb.rotate_(
                 positions, q[..., self.qk_nope_head_dim :], k_pe
-            )
+            ):
+                q[..., self.qk_nope_head_dim :], k_pe = rotary_emb(
+                    positions, q[..., self.qk_nope_head_dim :], k_pe
+                )
             if self.ssmax is not None:
                 q = self.ssmax(q, log_positions)
         elif self.ssmax is not None:

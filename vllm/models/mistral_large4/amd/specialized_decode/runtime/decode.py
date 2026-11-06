@@ -29,9 +29,7 @@ FAULT_MESSAGE = (
 
 
 def tp_agree(ok: bool) -> bool:
-    from vllm.models.mistral_large4.amd.specialized_decode.mono.common.runtime.consensus import (  # noqa: E501
-        tp_agree as agree,
-    )
+    from aiter.ops.flydsl.mono.runtime.consensus import tp_agree as agree
 
     return agree(ok, get_tp_group().cpu_group)
 

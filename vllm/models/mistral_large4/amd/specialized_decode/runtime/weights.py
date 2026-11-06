@@ -20,23 +20,11 @@ from vllm.model_executor.layers.quantization.online.fp8_requant import (
     dequant_block_fp8_to_bf16,
 )
 from vllm.model_executor.layers.quantization.utils.mxfp4_utils import mxfp4_quantize
-from vllm.models.mistral_large4.amd.specialized_decode.mono.common.runtime.consensus import (  # noqa: E501
-    MonoUnsupported,
-)
-from vllm.models.mistral_large4.amd.specialized_decode.mono.common.weights.config import (  # noqa: E501
-    Mxfp4ScaleLayout,
-    Mxfp4WeightLayout,
-)
-from vllm.models.mistral_large4.amd.specialized_decode.mono.common.weights.layer import (  # noqa: E501
-    LayerWeights,
-)
-from vllm.models.mistral_large4.amd.specialized_decode.mono.common.weights.packing import (  # noqa: E501
-    pack_bf16,
-    pack_fp8,
-)
-from vllm.models.mistral_large4.amd.specialized_decode.runtime.variants import (
-    KernelVariant,
-)
+from aiter.ops.flydsl.mono.runtime.consensus import MonoUnsupported
+from aiter.ops.flydsl.mono.variants import KernelVariant
+from aiter.ops.flydsl.mono.weights.config import Mxfp4ScaleLayout, Mxfp4WeightLayout
+from aiter.ops.flydsl.mono.weights.layer import LayerWeights
+from aiter.ops.flydsl.mono.weights.packing import pack_bf16, pack_fp8
 
 FP8 = torch.float8_e4m3fn
 N_ROUTED = 128

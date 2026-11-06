@@ -5,7 +5,9 @@
 The embedding and the dense layer 0 run the original modules; every MoE layer
 (1..71) is one launch mapping the residual stream ``x`` ([rows, hidden]) to the
 next layer's ``x`` (attention, MoE and both TP all-reduces inside the kernel),
-alternating between two buffers; the final norm runs the original module. Each
+alternating between two buffers, except that the stream entering a layer the
+draft model taps gets a buffer of its own (no later launch overwrites it, so
+the taps need no copies); the final norm runs the original module. Each
 row is one request's single decode token. The kernels read and write vLLM's
 own caches: the bf16 MLA latent pages ([blocks, page, 576]) and the DSA
 indexer's FP8 key pages ([blocks, page, 132]), through the step's block table
@@ -33,9 +35,7 @@ from vllm.distributed import (
 )
 from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
-from vllm.models.mistral_large4.amd.specialized_decode.mono.common.runtime.peer_memory import (  # noqa: E501
-    SymmetricPeerBuffer,
-)
+from aiter.ops.flydsl.mono.runtime.peer_memory import SymmetricPeerBuffer
 
 from .spec import DecodeConfig
 from .variants import load_variant
@@ -229,6 +229,11 @@ class MonoRunner:
             for rows, kind, v, inter, with_indexer in builds
         }
         dev = self.cos.device
+        # a launcher may read past its layout (the rocKE kernel's dual-copy
+        # mailboxes): it names the scratch it needs and prepares it
+        for (rows, kind), fn in self.launch.items():
+            key = KINDS[kind][:2]
+            scratch_bytes[key] = max(scratch_bytes[key], getattr(fn, "scratch_bytes", 0))
         # one rank-local scratch per kernel package (sized for the widest
         # step): mailboxes of different geometries never share bytes; the RoPE
         # package's holds the top-k the index-sharing layers read
@@ -236,6 +241,10 @@ class MonoRunner:
             key: torch.zeros(n, dtype=torch.uint8, device=dev)
             for key, n in scratch_bytes.items()
         }
+        for (rows, kind), fn in self.launch.items():
+            prepare = getattr(fn, "prepare_scratch", None)
+            if prepare is not None:
+                prepare(self.scratch[KINDS[kind][:2]])
         self.peers = SymmetricPeerBuffer(
             fault_offset + FAULT_WORD_BYTES,
             rank=self.rank,
@@ -250,6 +259,21 @@ class MonoRunner:
             torch.empty(self.max_rows, HIDDEN, dtype=torch.bfloat16, device=dev)
             for _ in range(2)
         ]
+        # bufs[k] holds the residual stream entering layer k + 1: launch i
+        # reads bufs[i] and writes bufs[i + 1]
+        n = len(self.moe)
+        self.tap_layers = sorted(
+            t for t in self.model.aux_hidden_state_layers if 1 <= t <= n + 1
+        )
+        self.bufs: list[torch.Tensor] = []
+        for layer in range(1, n + 2):
+            if layer in self.tap_layers:
+                buf = torch.empty_like(self.x[0])
+            elif self.bufs and self.bufs[-1] is self.x[0]:
+                buf = self.x[1]
+            else:
+                buf = self.x[0]
+            self.bufs.append(buf)
         self.indptr = torch.zeros(self.max_rows + 1, dtype=torch.int32, device=dev)
         self.block_table_stride = block_table_stride
         logger.info(
@@ -296,7 +320,8 @@ class MonoRunner:
             # the dense MLP left a TP-partial sum (its reduction is fused into
             # the next layer's input norm, which the kernels replace)
             hidden = tensor_model_parallel_all_reduce(hidden)
-        torch.add(hidden, residual, out=self.x[0][:rows])
+        bufs = self.bufs
+        torch.add(hidden, residual, out=bufs[0][:rows])
         fwd = get_forward_context()
         block_table = fwd.attn_metadata[self.layer_name].block_table
         slots = fwd.slot_mapping[self.layer_name]
@@ -318,12 +343,8 @@ class MonoRunner:
             else:
                 index_arg = _ptr(lw.attn.indexer.k_cache.kv_cache)
             nope, kvs, _ = KINDS[lw.kind]
-            if i + 1 in taps:
-                # launch i is layer i + 1 and reads x[i % 2]; launch i + 1
-                # overwrites it
-                aux_hidden_states.append(self.x[i % 2][:rows].clone())
             self.launch[(rows, lw.kind)](
-                _ptr(self.x[i % 2]), _ptr(self.x[(i + 1) % 2]), _ptr(block_table),
+                _ptr(bufs[i]), _ptr(bufs[i + 1]), _ptr(block_table),
                 _ptr(positions), _ptr(slots), _ptr(self.indptr),
                 _ptr(kv), _ptr(kv), index_arg, _ptr(self.cos), _ptr(self.sin),
                 *(_ptr(a[name]) for name in _WEIGHT_ARGS),
@@ -333,9 +354,8 @@ class MonoRunner:
                 stream=stream,
             )  # fmt: skip
         self.step.add_(1)
-        x = self.x[len(self.moe) % 2][:rows]
-        if len(model.layers) in taps:
-            aux_hidden_states.append(x.clone())
+        x = bufs[len(self.moe)][:rows]
+        aux_hidden_states += [bufs[t - 1][:rows] for t in self.tap_layers]
         hidden = model.norm(x)
         if aux_hidden_states:
             return hidden, aux_hidden_states

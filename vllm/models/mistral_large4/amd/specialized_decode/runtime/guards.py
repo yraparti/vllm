@@ -16,9 +16,7 @@ INDEX_ROW = 132  # DSA indexer key row: 128 E4M3 bytes + one fp32 scale
 
 def model_refusals(model, config: DecodeConfig) -> list[str]:
     """After load: the layer mix, each kernel layer's weights, the device."""
-    from vllm.models.mistral_large4.amd.specialized_decode.mono.common.runtime.consensus import (  # noqa: E501
-        MonoUnsupported,
-    )
+    from aiter.ops.flydsl.mono.runtime.consensus import MonoUnsupported
 
     from .weights import check_moe_layer, moe_kinds
 
@@ -41,10 +39,13 @@ def model_refusals(model, config: DecodeConfig) -> list[str]:
     try:
         import flydsl  # noqa: F401
         from aiter.ops.flydsl.kernels import buffer_ops  # noqa: F401
+        from aiter.ops.flydsl.mono.variants import load_variant  # noqa: F401
 
         from vllm.platforms.rocm import get_cdna_version
+
+        load_variant(False, False)  # probe the aiter-hosted mono package
     except ImportError as err:
-        reasons.append(f"requires FlyDSL and AITER FlyDSL helpers ({err})")
+        reasons.append(f"requires FlyDSL and AITER FlyDSL mono ({err})")
         return reasons
     if get_cdna_version() != 4:
         reasons.append("requires CDNA4 / gfx950")

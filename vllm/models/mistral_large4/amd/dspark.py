@@ -29,6 +29,7 @@ import torch
 from torch import nn
 
 from vllm.config import VllmConfig
+from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
@@ -37,11 +38,14 @@ from vllm.model_executor.models.qwen3_dspark import DSparkMarkovHead
 from vllm.model_executor.models.utils import get_draft_quant_config, maybe_prefix
 from vllm.models.mistral.common.layer_spec import MistralLayerSpec
 from vllm.models.mistral.common.rope import MistralRotaryEmbedding
+from vllm.models.mistral_large4.amd import draft_fp8, rocke_draft
 from vllm.models.mistral_large4.amd.model import (
     _STACKED_PARAMS,
     MistralLarge4DecoderLayer,
     _to_vllm_weight_name,
 )
+
+logger = init_logger(__name__)
 
 # Mistral DSpark checkpoint name (after the ``mtp_dspark.`` prefix) -> module.
 _DSPARK_NAME_MAP: list[tuple[str, str]] = [
@@ -192,7 +196,11 @@ class MistralLarge4DSparkModel(nn.Module):
 
     def combine_hidden_states(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if self.target_projection is not None:
-            hidden_states = self.target_projection(hidden_states)[0]
+            # VLLM_ML4_DRAFT_FP8: the decode rows through an FP8 copy
+            projected = draft_fp8.gemv_fp8(hidden_states, self.target_projection.weight)
+            hidden_states = (
+                projected if projected is not None else self.target_projection(hidden_states)[0]
+            )
         return self.target_norm(hidden_states)
 
     @torch.inference_mode()
@@ -212,7 +220,10 @@ class MistralLarge4DSparkModel(nn.Module):
             kv = attn.kv_a_proj_with_mqa(context_states)[0]
             kv_c_normed = attn.kv_a_layernorm(kv[:, : attn.kv_lora_rank])
             k_pe = kv[:, None, attn.kv_lora_rank :]
-            _, k_pe = self.rotary_emb(context_positions, torch.empty_like(k_pe), k_pe)
+            if not self.rotary_emb.rotate_(context_positions, None, k_pe):
+                _, k_pe = self.rotary_emb(
+                    context_positions, torch.empty_like(k_pe), k_pe
+                )
             slot_mapping = (
                 context_slot_mapping[i]
                 if isinstance(context_slot_mapping, (list, tuple))
@@ -255,6 +266,13 @@ class MistralLarge4DSparkModel(nn.Module):
     ) -> torch.Tensor:
         if inputs_embeds is None:
             inputs_embeds = self.embed_input_ids(input_ids)
+        # VLLM_ML4_DRAFT_ROCKE: a decode block through the fused layer kernels,
+        # which return the residual stream itself (TP-reduced in-kernel)
+        rocke = getattr(self, "rocke_draft", None)
+        if rocke is not None:
+            stream = rocke(positions, inputs_embeds)
+            if stream is not None:
+                return self.final_norm(stream)
         # Only consumed by SSMax, which draft layers do not use.
         log_positions = positions
         hidden_states = inputs_embeds
@@ -280,6 +298,7 @@ class MistralLarge4DSparkForCausalLM(nn.Module):
         assert vllm_config.speculative_config is not None
         draft_model_config = vllm_config.speculative_config.draft_model_config
         self.config = draft_model_config.hf_config
+        self._rocke_geometry = (vllm_config.model_config.max_model_len, vllm_config.cache_config.block_size)
         self.model = MistralLarge4DSparkModel(
             vllm_config=vllm_config,
             start_layer_id=vllm_config.model_config.get_total_num_hidden_layers(),
@@ -330,7 +349,25 @@ class MistralLarge4DSparkForCausalLM(nn.Module):
         return self.logits_processor(self.lm_head, hidden_states)
 
     def compute_draft_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        return self.compute_logits(hidden_states)
+        # VLLM_ML4_DRAFT_FP8: the draft's lm_head GEMV through an FP8 copy of
+        # this rank's vocabulary shard; the target's own logits keep bf16
+        assert self.lm_head is not None
+        local = draft_fp8.gemv_fp8(hidden_states, self.lm_head.weight)
+        if local is None:
+            return self.compute_logits(hidden_states)
+        # the rest of LogitsProcessor.forward: gather, padding, soft cap, scale
+        lp = self.logits_processor
+        logits = lp._gather_logits(local) if self.lm_head.tp_size > 1 else local
+        if logits is None:  # a gather (not all-gather) platform's other ranks
+            return logits
+        logits = logits[..., : lp.org_vocab_size]
+        if lp.soft_cap is not None:
+            logits = logits / lp.soft_cap
+            logits = torch.tanh(logits)
+            logits = logits * lp.soft_cap
+        if lp.scale != 1.0:
+            logits *= lp.scale
+        return logits
 
     def map_draft_to_target(self, draft_ids: torch.Tensor) -> torch.Tensor:
         return draft_ids
@@ -348,6 +385,17 @@ class MistralLarge4DSparkForCausalLM(nn.Module):
 
     def markov_bias(self, markov_embed: torch.Tensor) -> torch.Tensor:
         return self.model.markov_head.bias(markov_embed, self.markov_logits_processor)
+
+    def sample_sequential(
+        self, speculator, num_reqs: int, head_hidden: torch.Tensor
+    ) -> bool:
+        """DSparkSpeculator._sample_sequential asks this first. Greedy drafts
+        with the recurrent Markov head run the fused launches
+        (fused_markov.py) and this returns True; for any other step it returns
+        False, having done nothing, and the speculator runs its own loop."""
+        from .fused_markov import sample_sequential
+
+        return sample_sequential(speculator, self, num_reqs, head_hidden)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         params = dict(self.named_parameters())
@@ -385,4 +433,13 @@ class MistralLarge4DSparkForCausalLM(nn.Module):
             }
         if missing := required - loaded:
             raise ValueError(f"DSpark checkpoint is missing {sorted(missing)}")
+        if draft_fp8.Q128:
+            draft_fp8.fake_quant_draft_layers(self.model.layers)
+        if rocke_draft.ENABLED:
+            why = rocke_draft.refusal(self.model)
+            if why is None:
+                # before vLLM's memory profiling, as the target's kernel weights
+                self.model.rocke_draft = rocke_draft.RockeDraft(self.model, *self._rocke_geometry)
+            else:
+                logger.warning("ML4 draft: rocKE layers off (%s)", why)
         return loaded
